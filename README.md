@@ -26,17 +26,13 @@ Go to the **[Releases](../../releases/latest)** page to download the ready-to-us
 |------|-----------|
 | `Switex.exe` | **All-in-one app** — includes Python and all dependencies. Double-click to launch. Shows a system tray icon with Start / Stop / Restart / Exit. No installation required. |
 
-### macOS
+### macOS & Linux
 | File | What it is |
 |------|-----------|
 | `switex.py` | Main script |
-| `setup_macos.sh` | Setup & launcher — checks dependencies, permissions, and starts the daemon |
-
-### Linux
-| File | What it is |
-|------|-----------|
-| `switex.py` | Main script |
-| `setup_linux.sh` | Setup & launcher — detects X11 vs Wayland, installs ydotool if needed, starts the daemon |
+| `switex.sh` | **Service manager** — start, stop, restart, status, and log. Works on both macOS and Linux. |
+| `setup_macos.sh` | One-time setup — checks dependencies and permissions (macOS) |
+| `setup_linux.sh` | One-time setup — detects X11 vs Wayland, installs ydotool if needed (Linux) |
 
 ---
 
@@ -62,21 +58,39 @@ Double-click `Switex.exe`. That's it.
 
 ---
 
-## 🍎 macOS & 🐧 Linux — Setup Scripts
+## 🍎 macOS & 🐧 Linux — switex.sh
 
-**You only need two files.** Download `switex.py` and your OS setup script from the [Releases](../../releases/latest) page, put them in the same folder, and run the script.
+**You need three files.** Download `switex.py`, `switex.sh`, and your OS setup script from the [Releases](../../releases/latest) page, put them all in the same folder, then:
+
+**Step 1 — Run the setup script once** (installs dependencies, checks permissions):
 
 | Your OS | Run with |
 |---------|----------|
 | **macOS** | `bash setup_macos.sh` |
 | **Linux** | `bash setup_linux.sh` |
 
-The setup script will:
-1. ✅ Check if Python 3.7+ is installed — guide you to install it if not
-2. ✅ Check for required packages (`pynput`, `pyperclip`) — offer to install them
-3. ✅ Detect your environment (X11 vs Wayland, Accessibility permission on macOS)
-4. ✅ Warn about anything needing manual action, with exact steps
-5. ✅ Start the daemon automatically
+**Step 2 — Use `switex.sh` for everything after that:**
+
+```bash
+bash switex.sh start      # start the hotkey daemon
+bash switex.sh stop       # stop the daemon
+bash switex.sh restart    # restart the daemon
+bash switex.sh status     # show status, PID, and dependency check
+bash switex.sh log        # view the log file
+bash switex.sh log -f     # follow the log live (like tail -f)
+bash switex.sh help       # show all commands
+```
+
+### What each script does
+
+| Task | Script |
+|------|--------|
+| Install dependencies, check permissions | `setup_macos.sh` / `setup_linux.sh` (run once) |
+| Start / Stop / Restart daemon | `switex.sh` |
+| View status and dependency summary | `switex.sh status` |
+| View or follow the log | `switex.sh log` / `switex.sh log -f` |
+
+> **Tip:** To change the hotkey, edit the `HOTKEY=` line near the top of `switex.sh`.
 
 ---
 
@@ -249,9 +263,10 @@ Standard (ISIRI 9147) and Legacy layouts are auto-detected from the characters p
 switex/
 ├── switex.py             ← Core converter (all platforms, CLI + daemon)
 ├── switex_tray.py        ← Windows tray app (wraps switex.py)
+├── switex.sh             ← macOS & Linux service manager (start/stop/restart/status/log)
 ├── build.bat             ← Compiles Switex.exe from source (Windows, dev only)
-├── setup_macos.sh        ← macOS: check deps + launch daemon
-├── setup_linux.sh        ← Linux: check deps + launch daemon (X11 & Wayland)
+├── setup_macos.sh        ← macOS: one-time dependency check + first launch
+├── setup_linux.sh        ← Linux: one-time dependency check + first launch (X11 & Wayland)
 └── README.md
 ```
 
@@ -261,8 +276,9 @@ switex/
 |------|:-------:|:-----:|:-----:|
 | `Switex.exe` | ✅ download & run | — | — |
 | `switex.py` | — | ✅ required | ✅ required |
-| `setup_macos.sh` | — | ✅ required | — |
-| `setup_linux.sh` | — | — | ✅ required |
+| `switex.sh` | — | ✅ required | ✅ required |
+| `setup_macos.sh` | — | ✅ run once | — |
+| `setup_linux.sh` | — | — | ✅ run once |
 
 ---
 
@@ -286,6 +302,10 @@ git clone https://github.com/nonpop/xkblayout-state
 make -C xkblayout-state
 sudo cp xkblayout-state/xkblayout-state /usr/local/bin/
 ```
+
+**Daemon won't start after the first setup**
+→ Run `bash switex.sh status` to see a dependency summary and the last log lines
+→ Run `bash switex.sh log` to view the full log
 
 ---
 
