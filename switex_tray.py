@@ -13,20 +13,14 @@ import threading
 import queue
 import time
 import ctypes
-import subprocess
+import ctypes.wintypes as _wt
 
 # ── Resolve paths relative to the .exe / script itself ───────────────────────
 if getattr(sys, 'frozen', False):
-    # Running as compiled .exe (PyInstaller)
     BASE_DIR = os.path.dirname(sys.executable)
-    # switex.py is bundled inside the PyInstaller archive — we extract it
-    # to a temp location so it can be imported as a module.
-    import tempfile, importlib, types
 
     def _load_bundled_switex():
-        """Load switex module from PyInstaller bundle."""
         import importlib.util
-        # PyInstaller puts bundled data in sys._MEIPASS
         bundled = os.path.join(sys._MEIPASS, 'switex.py')
         spec = importlib.util.spec_from_file_location('switex', bundled)
         mod  = importlib.util.module_from_spec(spec)
@@ -36,7 +30,6 @@ if getattr(sys, 'frozen', False):
 
     switex = _load_bundled_switex()
 else:
-    # Running as plain .py script
     BASE_DIR = os.path.dirname(os.path.abspath(__file__))
     sys.path.insert(0, BASE_DIR)
     import switex
@@ -44,24 +37,94 @@ else:
 LOG_FILE  = os.path.join(BASE_DIR, 'switex.log')
 HOTKEY    = '<ctrl>+<alt>+<space>'
 APP_NAME  = 'Switex'
+APP_AUMID = 'Switex.App'   # App User Model ID used for WinRT toast notifications
 
-# ── Tray icon image (generated, no external file needed) ──────────────────────
+# Registry key for Windows startup
+_STARTUP_REG_KEY  = r'Software\Microsoft\Windows\CurrentVersion\Run'
+_STARTUP_REG_NAME = 'Switex'
+
+
+# ── Windows startup helpers ───────────────────────────────────────────────────
+
+def _get_exe_path() -> str:
+    if getattr(sys, 'frozen', False):
+        return sys.executable
+    return os.path.abspath(__file__)
+
+
+def is_startup_enabled() -> bool:
+    try:
+        import winreg
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, _STARTUP_REG_KEY) as key:
+            val, _ = winreg.QueryValueEx(key, _STARTUP_REG_NAME)
+            return os.path.normcase(val.strip('"')) == os.path.normcase(_get_exe_path())
+    except Exception:
+        return False
+
+
+def enable_startup() -> bool:
+    try:
+        import winreg
+        exe = _get_exe_path()
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, _STARTUP_REG_KEY,
+                            0, winreg.KEY_SET_VALUE) as key:
+            winreg.SetValueEx(key, _STARTUP_REG_NAME, 0, winreg.REG_SZ, f'"{exe}"')
+        return True
+    except Exception:
+        return False
+
+
+def disable_startup() -> bool:
+    try:
+        import winreg
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, _STARTUP_REG_KEY,
+                            0, winreg.KEY_SET_VALUE) as key:
+            winreg.DeleteValue(key, _STARTUP_REG_NAME)
+        return True
+    except Exception:
+        return False
+
+
+# ── Icon helpers ──────────────────────────────────────────────────────────────
+
+def _resolve_ico_path() -> str | None:
+    """Return path to switex.ico: beside the exe first, then _MEIPASS bundle."""
+    p = os.path.join(BASE_DIR, 'switex.ico')
+    if os.path.exists(p):
+        return p
+    if getattr(sys, 'frozen', False):
+        p = os.path.join(sys._MEIPASS, 'switex.ico')
+        if os.path.exists(p):
+            return p
+    return None
+
+
 def _make_icon(running: bool):
-    """
-    Generate a simple tray icon using Pillow.
-    Green keyboard symbol = running, grey = stopped.
-    """
+    """Load switex.ico for the tray. Greyscale when stopped. Falls back to generated."""
+    from PIL import Image
+    ico_path = _resolve_ico_path()
+    if ico_path:
+        try:
+            img = Image.open(ico_path).convert('RGBA')
+            img = img.resize((64, 64), Image.LANCZOS)
+            if not running:
+                import PIL.ImageEnhance as _enh
+                img = _enh.Color(img).enhance(0.0)
+                img = _enh.Brightness(img).enhance(0.75)
+            return img
+        except Exception:
+            pass
+    return _make_icon_generated(running)
+
+
+def _make_icon_generated(running: bool):
+    """Fallback generated tray icon."""
     from PIL import Image, ImageDraw, ImageFont
     size = 64
     img  = Image.new('RGBA', (size, size), (0, 0, 0, 0))
     draw = ImageDraw.Draw(img)
-
-    # Background circle
     color = (40, 180, 40, 255) if running else (120, 120, 120, 255)
     draw.ellipse([2, 2, size - 2, size - 2], fill=color)
-
-    # "S" letter for Switex
-    # Use default font — no external font file needed
     try:
         font = ImageFont.truetype('arialbd.ttf', 36)
     except Exception:
@@ -69,14 +132,85 @@ def _make_icon(running: bool):
             font = ImageFont.truetype('arial.ttf', 36)
         except Exception:
             font = ImageFont.load_default()
-
     text = 'S'
     bbox = draw.textbbox((0, 0), text, font=font)
-    tw   = bbox[2] - bbox[0]
-    th   = bbox[3] - bbox[1]
+    tw = bbox[2] - bbox[0]
+    th = bbox[3] - bbox[1]
     draw.text(((size - tw) / 2 - bbox[0], (size - th) / 2 - bbox[1]),
               text, font=font, fill=(255, 255, 255, 255))
     return img
+
+
+# ── AUMID registration + process identity ────────────────────────────────────
+
+def _setup_app_identity() -> None:
+    """
+    Two steps are both required to make Windows show "Switex" (not "Switex.exe")
+    and the correct custom icon in toast notifications:
+
+    1. Registry entry under HKCU\Software\Classes\AppUserModelId\Switex.App
+       Sets DisplayName and IconUri — Windows reads these when rendering the toast.
+
+    2. SetCurrentProcessExplicitAppUserModelID — binds the running process to the
+       AUMID so WinRT picks up the registry entry for this process.
+
+    No admin rights needed (HKCU only).
+    """
+    # Step 1: registry
+    try:
+        import winreg
+        ico_path = _resolve_ico_path() or ''
+        key_path = rf'Software\Classes\AppUserModelId\{APP_AUMID}'
+        with winreg.CreateKeyEx(winreg.HKEY_CURRENT_USER, key_path,
+                                0, winreg.KEY_SET_VALUE) as key:
+            winreg.SetValueEx(key, 'DisplayName',         0, winreg.REG_SZ, APP_NAME)
+            winreg.SetValueEx(key, 'IconUri',             0, winreg.REG_SZ, ico_path)
+            winreg.SetValueEx(key, 'IconBackgroundColor', 0, winreg.REG_SZ, '00000000')
+    except Exception:
+        pass
+
+    # Step 2: bind process to AUMID
+    try:
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(APP_AUMID)
+    except Exception:
+        pass
+
+
+# ── Notification ──────────────────────────────────────────────────────────────
+
+_toaster = None   # cached so WinRT is only initialised once
+
+def _get_toaster():
+    global _toaster
+    if _toaster is None:
+        try:
+            from windows_toasts import InteractableWindowsToaster
+            _toaster = InteractableWindowsToaster(APP_NAME, notifierAUMID=APP_AUMID)
+        except Exception:
+            _toaster = False
+    return _toaster if _toaster else None
+
+
+def _notify(icon, title: str, message: str) -> None:
+    """
+    Send a Windows toast notification via WinRT (windows-toasts).
+    Using InteractableWindowsToaster + our AUMID causes Windows to display:
+      • "Switex" as the app name (not "Switex.exe")
+      • our custom icon from the registry IconUri
+    Falls back to pystray's built-in notify if windows-toasts is unavailable.
+    """
+    try:
+        from windows_toasts import Toast
+        toaster = _get_toaster()
+        if toaster is None:
+            raise RuntimeError('windows-toasts unavailable')
+        t = Toast(text_fields=[title, message])
+        toaster.show_toast(t)
+    except Exception:
+        try:
+            icon.notify(message, title)
+        except Exception:
+            pass
 
 
 # ── Daemon thread management ──────────────────────────────────────────────────
@@ -90,7 +224,6 @@ def _daemon_is_alive() -> bool:
 
 
 def _run_daemon_thread():
-    """Run switex daemon in a background thread."""
     _daemon_stop_event.clear()
     try:
         switex._log_file = LOG_FILE
@@ -102,7 +235,7 @@ def _run_daemon_thread():
 def start_daemon():
     global _daemon_thread
     if _daemon_is_alive():
-        return False  # already running
+        return False
     _daemon_thread = threading.Thread(target=_run_daemon_thread, daemon=True)
     _daemon_thread.start()
     time.sleep(0.5)
@@ -110,12 +243,10 @@ def start_daemon():
 
 
 def stop_daemon():
-    """Stop the daemon cleanly via pynput listener .stop() or KeyboardInterrupt."""
     global _daemon_thread
     if not _daemon_is_alive():
         return
 
-    # Preferred: call pynput listener's own .stop() method
     listener = getattr(switex, '_active_listener', None)
     if listener is not None:
         try:
@@ -124,8 +255,6 @@ def stop_daemon():
         except Exception:
             pass
 
-    # Fallback: raise KeyboardInterrupt in the daemon thread
-    # (caught by the except KeyboardInterrupt in run_daemon)
     if _daemon_is_alive() and _daemon_thread and _daemon_thread.ident:
         ctypes.pythonapi.PyThreadState_SetAsyncExc(
             ctypes.c_ulong(_daemon_thread.ident),
@@ -138,10 +267,12 @@ def stop_daemon():
 
 
 # ── Tray application ──────────────────────────────────────────────────────────
+
 def _build_menu(tray_icon):
-    """Build the right-click tray menu based on current state."""
     import pystray
-    running = _daemon_is_alive()
+    running       = _daemon_is_alive()
+    startup_on    = is_startup_enabled()
+    startup_label = 'Run at Startup  ✓' if startup_on else 'Run at Startup'
 
     def on_start(icon, item):
         if not _daemon_is_alive():
@@ -179,6 +310,19 @@ def _build_menu(tray_icon):
             _notify(icon, 'Switex — Stopped',
                     'Daemon is not running. Click Start to activate.')
 
+    def on_toggle_startup(icon, item):
+        if is_startup_enabled():
+            ok = disable_startup()
+            _notify(icon, 'Startup Disabled',
+                    'Switex will no longer start with Windows.' if ok
+                    else 'Failed to remove startup entry.')
+        else:
+            ok = enable_startup()
+            _notify(icon, 'Startup Enabled',
+                    'Switex will now start automatically with Windows.' if ok
+                    else 'Failed to add startup entry.')
+        icon.menu = _build_menu(icon)
+
     def on_open_log(icon, item):
         if os.path.exists(LOG_FILE):
             os.startfile(LOG_FILE)
@@ -193,50 +337,42 @@ def _build_menu(tray_icon):
     status_label = '● Running' if running else '○ Stopped'
 
     return pystray.Menu(
-        pystray.MenuItem(f'{APP_NAME}  {status_label}',
-                         None, enabled=False),
+        pystray.MenuItem(f'{APP_NAME}  {status_label}', None, enabled=False),
         pystray.Menu.SEPARATOR,
         pystray.MenuItem('Start',   on_start,   enabled=not running),
         pystray.MenuItem('Stop',    on_stop,    enabled=running),
         pystray.MenuItem('Restart', on_restart, enabled=running),
         pystray.Menu.SEPARATOR,
-        pystray.MenuItem('Status',   on_status),
-        pystray.MenuItem('Open Log', on_open_log),
+        pystray.MenuItem('Status',      on_status),
+        pystray.MenuItem(startup_label, on_toggle_startup),
+        pystray.MenuItem('Open Log',    on_open_log),
         pystray.Menu.SEPARATOR,
         pystray.MenuItem('Exit', on_exit),
     )
 
 
-def _notify(icon, title: str, message: str):
-    """Show a Windows balloon notification."""
-    try:
-        icon.notify(message, title)
-    except Exception:
-        pass  # notifications not critical
-
-
 def _check_already_running() -> bool:
-    """Use a Windows named mutex to prevent multiple instances."""
     mutex = ctypes.windll.kernel32.CreateMutexW(None, False, 'SwitexTrayMutex')
     err   = ctypes.windll.kernel32.GetLastError()
-    return err == 183  # ERROR_ALREADY_EXISTS
+    return err == 183
 
 
 def main():
     import pystray
 
-    # Single instance guard
     if _check_already_running():
         ctypes.windll.user32.MessageBoxW(
             0,
             'Switex is already running in the system tray.\n\n'
             'Look for the  S  icon in your taskbar notification area.',
             'Switex',
-            0x40  # MB_ICONINFORMATION
+            0x40
         )
         sys.exit(0)
 
-    # Auto-start daemon on launch
+    # Register AUMID so Windows uses our icon in toast notifications
+    _setup_app_identity()
+
     start_daemon()
     running = _daemon_is_alive()
 
@@ -247,7 +383,6 @@ def main():
     )
     icon.menu = _build_menu(icon)
 
-    # Show startup notification
     def _on_setup(icon):
         icon.visible = True
         if running:
