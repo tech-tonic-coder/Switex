@@ -1,11 +1,17 @@
 @echo off
 setlocal EnableDelayedExpansion
 set "DIR=%~dp0"
-title Switex — Build
+title Switex -- Build
 
+:: Keep the window open on any unexpected exit
+if "%~1"=="__child__" goto :main_start
+cmd /k "%~f0" __child__
+exit /b
+
+:main_start
 echo.
 echo =========================================
-echo   Switex — Build Switex.exe
+echo   Switex - Build Switex.exe
 echo =========================================
 echo.
 echo This will compile Switex into a single Switex.exe
@@ -36,11 +42,11 @@ if not defined PYTHON (
 )
 echo [OK] Python found  (%PYTHON%)
 
-:: ── Install / upgrade required packages ──────────────────────────────────────
+:: ── Install/upgrade required packages ──────────────────────────────────────
 echo.
 echo [INSTALL] Installing required packages...
 %PYTHON% -m pip install --upgrade pip >nul
-%PYTHON% -m pip install pynput pyperclip pystray Pillow pyinstaller
+%PYTHON% -m pip install pynput pyperclip pystray Pillow pyinstaller windows-toasts
 
 if errorlevel 1 (
     echo.
@@ -50,56 +56,67 @@ if errorlevel 1 (
 )
 echo [OK] All packages installed.
 
-:: ── Generate a simple icon file ───────────────────────────────────────────────
+:: ── Resolve icon ──────────────────────────────────────────────────────────────
 echo.
-echo [BUILD] Generating icon...
-%PYTHON% -c "
-from PIL import Image, ImageDraw, ImageFont
-import os
+set "ICON_OPT="
+set "ICON_DATA_OPT="
+set "ICON_FILE=%DIR%switex.ico"
 
-size = 256
-img  = Image.new('RGBA', (size, size), (0,0,0,0))
-draw = ImageDraw.Draw(img)
+if exist "%ICON_FILE%" goto :icon_found
+goto :icon_generate
 
-# Green circle background
-draw.ellipse([4, 4, size-4, size-4], fill=(34, 160, 54, 255))
+:icon_found
+echo [ICON] Found switex.ico -- using it for exe and tray.
+set "ICON_OPT=--icon=%ICON_FILE%"
+set "ICON_DATA_OPT=--add-data "%ICON_FILE%;.""
+goto :icon_done
 
-# White 'S' letter
-try:
-    font = ImageFont.truetype('arialbd.ttf', 160)
-except:
-    try:
-        font = ImageFont.truetype('arial.ttf', 160)
-    except:
-        font = ImageFont.load_default()
+:icon_generate
+echo [ICON] switex.ico not found -- generating default green-circle icon...
 
-text = 'S'
-bbox = draw.textbbox((0,0), text, font=font)
-tw = bbox[2]-bbox[0]
-th = bbox[3]-bbox[1]
-draw.text(((size-tw)/2 - bbox[0], (size-th)/2 - bbox[1]),
-          text, font=font, fill=(255,255,255,255))
+set "GEN_SCRIPT=%TEMP%\switex_gen_icon.py"
+set "GEN_ICON=%DIR%switex_icon.ico"
 
-# Save as ICO with multiple sizes
-icon_path = os.path.join(r'%DIR%', 'switex_icon.ico')
-img_16  = img.resize((16,16),   Image.LANCZOS)
-img_32  = img.resize((32,32),   Image.LANCZOS)
-img_48  = img.resize((48,48),   Image.LANCZOS)
-img_64  = img.resize((64,64),   Image.LANCZOS)
-img_128 = img.resize((128,128), Image.LANCZOS)
-img_256 = img.resize((256,256), Image.LANCZOS)
-img_256.save(icon_path, format='ICO',
-             sizes=[(16,16),(32,32),(48,48),(64,64),(128,128),(256,256)])
-print(f'Icon saved to: {icon_path}')
-"
+(
+echo from PIL import Image, ImageDraw, ImageFont
+echo import sys
+echo size = 256
+echo img  = Image.new^('RGBA', ^(size, size^), ^(0, 0, 0, 0^)^)
+echo draw = ImageDraw.Draw^(img^)
+echo draw.ellipse^([4, 4, size-4, size-4], fill=^(34, 160, 54, 255^)^)
+echo try:
+echo     font = ImageFont.truetype^('arialbd.ttf', 160^)
+echo except Exception:
+echo     try:
+echo         font = ImageFont.truetype^('arial.ttf', 160^)
+echo     except Exception:
+echo         font = ImageFont.load_default^(^)
+echo text = 'S'
+echo bbox = draw.textbbox^(^(0, 0^), text, font=font^)
+echo tw = bbox[2] - bbox[0]
+echo th = bbox[3] - bbox[1]
+echo draw.text^(^(^(size - tw^) / 2 - bbox[0], ^(size - th^) / 2 - bbox[1]^), text, font=font, fill=^(255, 255, 255, 255^)^)
+echo icon_path = sys.argv[1]
+echo sizes = [16, 32, 48, 64, 128, 256]
+echo frames = [img.resize^(^(s, s^), Image.LANCZOS^) for s in sizes]
+echo frames[-1].save^(icon_path, format='ICO', sizes=[(s, s^) for s in sizes]^)
+echo print^('Icon saved to: ' + icon_path^)
+) > "%GEN_SCRIPT%"
 
-if errorlevel 1 (
-    echo [WARN] Icon generation failed. Building without custom icon.
+%PYTHON% "%GEN_SCRIPT%" "%GEN_ICON%"
+set "GEN_ERR=%ERRORLEVEL%"
+del "%GEN_SCRIPT%" >nul 2>&1
+
+if %GEN_ERR% neq 0 (
+    echo [WARN] Icon generation failed. Building without a custom icon.
     set "ICON_OPT="
-) else (
-    set "ICON_OPT=--icon=%DIR%switex_icon.ico"
-    echo [OK] Icon generated.
+    set "ICON_DATA_OPT="
+    goto :icon_done
 )
+echo [OK] Default icon generated.
+set "ICON_OPT=--icon=%GEN_ICON%"
+
+:icon_done
 
 :: ── Run PyInstaller ───────────────────────────────────────────────────────────
 echo.
@@ -112,12 +129,16 @@ echo.
     --windowed ^
     --name Switex ^
     --add-data "%DIR%switex.py;." ^
+    %ICON_DATA_OPT% ^
     %ICON_OPT% ^
     --hidden-import pynput.keyboard ^
     --hidden-import pynput.mouse ^
     --hidden-import pystray._win32 ^
     --hidden-import PIL._imaging ^
     --hidden-import pyperclip ^
+    --hidden-import windows_toasts ^
+    --hidden-import winrt.windows.ui.notifications ^
+    --hidden-import winrt.windows.data.xml.dom ^
     --clean ^
     --noconfirm ^
     "%DIR%switex_tray.py"
@@ -144,7 +165,7 @@ if exist "%DIR%dist\Switex.exe" (
     echo.
     echo   Right-click the tray icon for:
     echo     Start / Stop / Restart / Status
-    echo     Open Log / Exit
+    echo     Run at Startup / Open Log / Exit
     echo =========================================
 ) else (
     echo [ERROR] Switex.exe not found in dist\ folder.
